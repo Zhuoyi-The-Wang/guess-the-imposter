@@ -1,0 +1,16 @@
+{
+  "name": "guess-the-imposter-server",
+  "version": "1.0.0",
+  "description": "Socket.io game server for Guess the Imposter",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5"
+  }
+}

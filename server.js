@@ -1,20 +1,122 @@
-// server.js
 const { createServer } = require("http");
 const { Server } = require("socket.io");
+const https = require("https");
+require("dotenv").config();
 
-// ─── Word List ────────────────────────────────────────────────────────────────
-const WORD_CATEGORIES = {
-  Food:       ["Sushi", "Pizza", "Tacos", "Ramen", "Burger", "Croissant", "Dumpling", "Gelato", "Fondue", "Paella"],
-  Places:     ["Airport", "Library", "Casino", "Hospital", "Submarine", "Space Station", "Circus", "Sauna", "Lighthouse", "Igloo"],
-  Activities: ["Surfing", "Skydiving", "Meditation", "Karaoke", "Archery", "Scuba Diving", "Bouldering", "Fencing", "Falconry", "Jousting"],
-  Objects:    ["Telescope", "Accordion", "Periscope", "Metronome", "Kaleidoscope", "Theremin", "Compass", "Abacus", "Sextant", "Sundial"],
-  Animals:    ["Platypus", "Axolotl", "Narwhal", "Pangolin", "Quokka", "Capybara", "Mantis Shrimp", "Okapi", "Blobfish", "Tardigrade"],
-};
+// ─── Fallback word list (used if OpenAI call fails) ───────────────────────────
+const FALLBACK_WORDS = [
+  "Sushi", "Casino", "Surfing", "Telescope", "Platypus",
+  "Sauna", "Karaoke", "Accordion", "Narwhal", "Fondue",
+  "Lighthouse", "Skydiving", "Periscope", "Axolotl", "Paella",
+  "Submarine", "Falconry", "Theremin", "Capybara", "Igloo",
+  "Circus", "Jousting", "Sextant", "Quokka", "Bouldering",
+];
 
-function pickWord() {
-  const cats = Object.values(WORD_CATEGORIES);
-  const cat  = cats[Math.floor(Math.random() * cats.length)];
-  return cat[Math.floor(Math.random() * cat.length)];
+// ─── OpenAI word generation ───────────────────────────────────────────────────
+async function generateWordList() {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.warn("[words] No OPENAI_API_KEY set — using fallback list");
+    return shuffle([...FALLBACK_WORDS]);
+  }
+
+  const now      = new Date();
+  const nonce    = Math.random().toString(36).slice(2, 8);
+  const timeHint = now.toLocaleString("en-US", { weekday: "long", month: "long", hour: "numeric", hour12: true });
+
+  const prompt = `You are generating secret words for a social deduction party game called "Guess the Imposter".
+
+Rules for good words:
+- Concrete nouns or activities (things people can describe without giving the word away)
+- Interesting, specific, and a little unexpected — not generic like "dog" or "car"
+- Mix of categories: foods, places, activities, objects, animals, professions, phenomena
+- Each word should be instantly recognisable but have enough interesting details to spark questions
+- Avoid anything offensive, violent, or NSFW
+
+Seed info (use this to vary your output): time is ${timeHint}, nonce is ${nonce}.
+
+Return EXACTLY 25 words as a JSON array of strings. No extra text, no numbering, no markdown. Example format:
+["Word1","Word2","Word3"]`;
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model:       "gpt-4o-mini",
+      max_tokens:  300,
+      temperature: 1.1,
+      messages:    [{ role: "user", content: prompt }],
+    });
+
+    const req = https.request(
+      {
+        hostname: "api.openai.com",
+        path:     "/v1/chat/completions",
+        method:   "POST",
+        headers:  {
+          "Content-Type":   "application/json",
+          "Authorization":  `Bearer ${apiKey}`,
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        const chunks = [];
+
+        res.on("data", (chunk) => chunks.push(chunk));
+
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+
+          // Non-200 responses (bad key, quota exceeded, etc.)
+          if (res.statusCode !== 200) {
+            console.error(`[words] OpenAI returned HTTP ${res.statusCode}:`, raw.slice(0, 300));
+            return resolve(shuffle([...FALLBACK_WORDS]));
+          }
+
+          try {
+            const json    = JSON.parse(raw);
+            const content = json.choices?.[0]?.message?.content?.trim() ?? "";
+
+            // Strip accidental markdown fences like ```json ... ```
+            const clean = content.replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/, "").trim();
+
+            const words = JSON.parse(clean);
+
+            if (Array.isArray(words) && words.length >= 10) {
+              console.log(`[words] Generated ${words.length} words via OpenAI`);
+              resolve(words.slice(0, 25));
+            } else {
+              throw new Error(`Expected array of ≥10, got: ${JSON.stringify(words).slice(0, 100)}`);
+            }
+          } catch (e) {
+            console.error("[words] Parse error — using fallback:", e.message);
+            resolve(shuffle([...FALLBACK_WORDS]));
+          }
+        });
+      }
+    );
+
+    req.on("error", (e) => {
+      console.error("[words] Request error — using fallback:", e.message);
+      resolve(shuffle([...FALLBACK_WORDS]));
+    });
+
+    req.setTimeout(8000, () => {
+      console.warn("[words] Timeout — using fallback");
+      req.destroy();
+      resolve(shuffle([...FALLBACK_WORDS]));
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
 function genCode() {
@@ -28,17 +130,20 @@ function genCode() {
 const rooms = new Map();
 
 function getPublicRoom(room) {
+  const revealPhase = room.phase === "results" || room.phase === "scoreboard";
   return {
-    code:          room.code,
-    hostId:        room.hostId,
-    phase:         room.phase,
-    players:       Array.from(room.players.values()),
-    startPlayer:   room.startPlayer,
-    votes:         Object.fromEntries(room.votes),
-    winner:        room.winner,
-    winReason:     room.winReason,
-    imposterGuess: room.imposterGuess,
-    imposterId:    room.phase === "results" ? room.imposterId : null,
+    code:        room.code,
+    hostId:      room.hostId,
+    phase:       room.phase,
+    players:     Array.from(room.players.values()),
+    startPlayer: room.startPlayer,
+    winner:      room.winner,
+    winReason:   room.winReason,
+    imposterId:  revealPhase ? room.imposterId : null,
+    // Reveal the word to everyone once the round is over
+    revealWord:  revealPhase ? room.word : null,
+    roundNum:    room.roundNum,
+    wordsLeft:   room.wordQueue.length,
   };
 }
 
@@ -46,37 +151,47 @@ function broadcastRoom(io, room) {
   io.to(room.code).emit("room:update", getPublicRoom(room));
 }
 
-function resolveVote(io, room) {
-  const tally = new Map();
-  for (const targetId of room.votes.values()) {
-    tally.set(targetId, (tally.get(targetId) || 0) + 1);
+function nextWord(room) {
+  if (room.wordQueue.length > 0) return room.wordQueue.shift();
+  console.warn(`[room ${room.code}] Word queue empty — using fallback`);
+  return FALLBACK_WORDS[Math.floor(Math.random() * FALLBACK_WORDS.length)];
+}
+
+function beginRound(io, room) {
+  const ids        = Array.from(room.players.keys());
+  room.word        = nextWord(room);
+  room.imposterId  = ids[Math.floor(Math.random() * ids.length)];
+  room.startPlayer = ids[Math.floor(Math.random() * ids.length)];
+  room.phase       = "playing";
+  room.winner      = null;
+  room.winReason   = null;
+  room.roundNum   += 1;
+
+  for (const [sid] of room.players) {
+    const isImposter = sid === room.imposterId;
+    io.to(sid).emit("game:role", {
+      isImposter,
+      word:        isImposter ? null : room.word,
+      startPlayer: room.startPlayer,
+    });
   }
-  let maxVotes = 0, eliminated = null;
-  for (const [pid, count] of tally) {
-    if (count > maxVotes) { maxVotes = count; eliminated = pid; }
-  }
-  const name = room.players.get(eliminated)?.name ?? "Someone";
-  if (eliminated === room.imposterId) {
-    room.winner    = "players";
-    room.winReason = `${name} was the imposter! Players win!`;
-  } else {
-    room.winner    = "imposter";
-    room.winReason = `${name} was voted out, but wasn't the imposter. Imposter wins!`;
-  }
-  room.phase = "results";
+
   broadcastRoom(io, room);
 }
 
-// ─── HTTP + Socket.io server ──────────────────────────────────────────────────
+function scheduleWordGeneration(io, room) {
+  generateWordList().then((words) => {
+    room.wordQueue  = words;
+    room.wordsReady = true;
+    console.log(`[room ${room.code}] Word queue ready (${words.length} words)`);
+    io.to(room.code).emit("room:wordsReady", { wordsLeft: words.length });
+  });
+}
+
+// ─── HTTP + Socket.io ─────────────────────────────────────────────────────────
 const httpServer = createServer((req, res) => {
-  // Basic health check endpoint so Railway knows the service is alive
-  if (req.url === "/health") {
-    res.writeHead(200);
-    res.end("OK");
-    return;
-  }
-  res.writeHead(404);
-  res.end("Not found");
+  if (req.url === "/health") { res.writeHead(200); res.end("OK"); return; }
+  res.writeHead(404); res.end("Not found");
 });
 
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
@@ -84,10 +199,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   : "*";
 
 const io = new Server(httpServer, {
-  cors: {
-    origin: ALLOWED_ORIGINS,
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] },
 });
 
 io.on("connection", (socket) => {
@@ -97,18 +209,23 @@ io.on("connection", (socket) => {
     if (!name?.trim()) return cb?.({ error: "Name required" });
     let code;
     do { code = genCode(); } while (rooms.has(code));
+
     const room = {
       code, hostId: socket.id,
-      players: new Map([[socket.id, { id: socket.id, name: name.trim() }]]),
-      phase: "lobby", word: null, imposterId: null,
-      startPlayer: null, votes: new Map(),
-      imposterGuess: null, winner: null, winReason: null,
+      players:    new Map([[socket.id, { id: socket.id, name: name.trim(), score: 0 }]]),
+      phase:      "lobby",
+      word:       null, imposterId: null, startPlayer: null,
+      winner:     null, winReason: null, roundNum: 0,
+      wordQueue:  [],
+      wordsReady: false,
     };
+
     rooms.set(code, room);
     currentRoom = code;
     socket.join(code);
     cb?.({ code });
     broadcastRoom(io, room);
+    scheduleWordGeneration(io, room);
   });
 
   socket.on("room:join", ({ name, code }, cb) => {
@@ -118,109 +235,153 @@ io.on("connection", (socket) => {
     if (!room)                   return cb?.({ error: "Room not found" });
     if (room.phase !== "lobby")  return cb?.({ error: "Game already started" });
     if (room.players.size >= 12) return cb?.({ error: "Room is full (max 12)" });
-    room.players.set(socket.id, { id: socket.id, name: name.trim() });
+    room.players.set(socket.id, { id: socket.id, name: name.trim(), score: 0 });
     currentRoom = normalized;
     socket.join(normalized);
     cb?.({ code: normalized });
     broadcastRoom(io, room);
   });
 
-  socket.on("room:sync", ({ code }, cb) => {
-    const room = rooms.get(String(code).toUpperCase());
+  socket.on("room:sync", ({ code, name }, cb) => {
+    const normalized = String(code || "").toUpperCase().trim();
+    const room = rooms.get(normalized);
     if (!room) return cb?.({ error: "Room not found" });
-    if (room.players.has(socket.id)) {
-      currentRoom = String(code).toUpperCase();
-      socket.join(currentRoom);
-    }
-    cb?.({ room: getPublicRoom(room) });
-  });
 
-  socket.on("game:start", (_, cb) => {
-    const room = rooms.get(currentRoom);
-    if (!room)                     return cb?.({ error: "Room not found" });
-    if (room.hostId !== socket.id) return cb?.({ error: "Only the host can start" });
-    if (room.players.size < 2)     return cb?.({ error: "Need at least 2 players" });
-    const ids        = Array.from(room.players.keys());
-    room.word        = pickWord();
-    room.imposterId  = ids[Math.floor(Math.random() * ids.length)];
-    room.startPlayer = ids[Math.floor(Math.random() * ids.length)];
-    room.phase       = "playing";
-    room.votes       = new Map();
-    room.winner      = null; room.winReason = null; room.imposterGuess = null;
-    for (const [sid] of room.players) {
-      const isImposter = sid === room.imposterId;
-      io.to(sid).emit("game:role", {
+    currentRoom = normalized;
+    socket.join(normalized);
+
+    if (room.players.has(socket.id)) {
+      // Same socket ID — already in the room (tab still open, no migration needed)
+    } else if (name) {
+      // New socket ID after refresh/reconnect — find player by name and migrate
+      const trimmed = name.trim();
+      let existingEntry = null;
+      for (const [pid, player] of room.players) {
+        if (player.name === trimmed) { existingEntry = [pid, player]; break; }
+      }
+      if (existingEntry) {
+        const [oldId, player] = existingEntry;
+        room.players.delete(oldId);
+        player.id = socket.id;
+        room.players.set(socket.id, player);
+        if (room.hostId      === oldId) room.hostId      = socket.id;
+        if (room.imposterId  === oldId) room.imposterId  = socket.id;
+        if (room.startPlayer === oldId) room.startPlayer = socket.id;
+        broadcastRoom(io, room);
+      } else if (room.phase === "lobby" && room.players.size < 12) {
+        // Name not found, lobby still open — re-add as fresh player
+        room.players.set(socket.id, { id: socket.id, name: trimmed, score: 0 });
+        broadcastRoom(io, room);
+      }
+    }
+
+    // Bug fix 1: re-emit game:role so the reconnecting player's role card shows correctly.
+    // Without this, role stays null on the client and shows "Reconnecting…" forever.
+    if (room.phase === "playing" || room.phase === "results") {
+      const isImposter = room.imposterId === socket.id;
+      socket.emit("game:role", {
         isImposter,
         word:        isImposter ? null : room.word,
         startPlayer: room.startPlayer,
       });
     }
-    broadcastRoom(io, room);
-    cb?.({ ok: true });
+
+    cb?.({ room: getPublicRoom(room) });
   });
 
-  socket.on("vote:open", (_, cb) => {
-    const room = rooms.get(currentRoom);
-    if (!room)                    return cb?.({ error: "Room not found" });
-    if (room.phase !== "playing") return cb?.({ error: "Not in playing phase" });
-    room.phase = "voting"; room.votes = new Map();
-    broadcastRoom(io, room); cb?.({ ok: true });
-  });
-
-  socket.on("vote:cast", ({ targetId }, cb) => {
+  socket.on("game:start", (_, cb) => {
     const room = rooms.get(currentRoom);
     if (!room)                       return cb?.({ error: "Room not found" });
-    if (room.phase !== "voting")     return cb?.({ error: "Not voting phase" });
-    if (!room.players.has(targetId)) return cb?.({ error: "Invalid target" });
-    if (targetId === socket.id)      return cb?.({ error: "Can't vote yourself" });
-    room.votes.set(socket.id, targetId);
-    broadcastRoom(io, room);
-    if (room.votes.size === room.players.size) resolveVote(io, room);
+    if (room.hostId !== socket.id)   return cb?.({ error: "Only the host can start" });
+    if (room.players.size < 2)       return cb?.({ error: "Need at least 2 players" });
+    if (!room.wordsReady)            return cb?.({ error: "Words still generating, try again in a moment" });
+    if (room.wordQueue.length === 0) return cb?.({ error: "No words left — reset the game to get a new set" });
+
+    beginRound(io, room);
     cb?.({ ok: true });
   });
 
-  socket.on("imposter:guess", ({ guess }, cb) => {
+  socket.on("game:declare", ({ winner }, cb) => {
     const room = rooms.get(currentRoom);
-    if (!room)                         return cb?.({ error: "Room not found" });
-    if (room.imposterId !== socket.id) return cb?.({ error: "Not the imposter" });
-    if (room.phase !== "playing")      return cb?.({ error: "Can only guess during play" });
-    const norm    = s => s.toLowerCase().replace(/[^a-z]/g, "");
-    const correct = norm(guess) === norm(room.word);
-    room.imposterGuess = guess; room.phase = "results";
-    room.winner    = correct ? "imposter" : "players";
-    room.winReason = correct
-      ? `The imposter correctly guessed "${room.word}"! Imposter wins!`
-      : `The imposter guessed wrong ("${guess}"). The word was "${room.word}". Players win!`;
+    if (!room)                     return cb?.({ error: "Room not found" });
+    if (room.hostId !== socket.id) return cb?.({ error: "Only the host can declare" });
+    if (room.phase !== "playing")  return cb?.({ error: "Not in playing phase" });
+    if (winner !== "players" && winner !== "imposter") return cb?.({ error: "Invalid winner" });
+
+    room.winner = winner;
+    if (winner === "players") {
+      for (const [sid, player] of room.players) {
+        if (sid !== room.imposterId) player.score += 1;
+      }
+      const imposterName = room.players.get(room.imposterId)?.name ?? "The imposter";
+      room.winReason = `${imposterName} was the imposter! All players earn 1 point.`;
+    } else {
+      const imposter = room.players.get(room.imposterId);
+      if (imposter) imposter.score += 3;
+      room.winReason = `${room.players.get(room.imposterId)?.name ?? "The imposter"} fooled everyone and earns 3 points!`;
+    }
+
+    room.phase = "results";
     broadcastRoom(io, room);
-    cb?.({ ok: true, correct });
+    cb?.({ ok: true });
+  });
+
+  socket.on("game:nextRound", (_, cb) => {
+    const room = rooms.get(currentRoom);
+    if (!room)                       return cb?.({ error: "Room not found" });
+    if (room.hostId !== socket.id)   return cb?.({ error: "Only host can advance" });
+    if (room.wordQueue.length === 0) return cb?.({ error: "No words left — end the game to see scores" });
+
+    beginRound(io, room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("game:end", (_, cb) => {
+    const room = rooms.get(currentRoom);
+    if (!room)                     return cb?.({ error: "Room not found" });
+    if (room.hostId !== socket.id) return cb?.({ error: "Only host can end" });
+    room.phase = "scoreboard";
+    broadcastRoom(io, room);
+    cb?.({ ok: true });
   });
 
   socket.on("game:reset", (_, cb) => {
     const room = rooms.get(currentRoom);
     if (!room)                     return cb?.({ error: "Room not found" });
     if (room.hostId !== socket.id) return cb?.({ error: "Only host can reset" });
-    room.phase = "lobby"; room.word = null; room.imposterId = null;
-    room.startPlayer = null; room.votes = new Map();
-    room.winner = null; room.winReason = null; room.imposterGuess = null;
-    broadcastRoom(io, room); cb?.({ ok: true });
+
+    room.phase      = "lobby";
+    room.word       = null; room.imposterId = null; room.startPlayer = null;
+    room.winner     = null; room.winReason  = null; room.roundNum    = 0;
+    room.wordQueue  = [];
+    room.wordsReady = false;
+    for (const player of room.players.values()) player.score = 0;
+
+    broadcastRoom(io, room);
+    cb?.({ ok: true });
+    scheduleWordGeneration(io, room);
   });
 
   socket.on("disconnect", () => {
     if (!currentRoom) return;
     const room = rooms.get(currentRoom);
     if (!room) return;
-    room.players.delete(socket.id);
-    if (room.players.size === 0) { rooms.delete(currentRoom); return; }
-    if (room.hostId === socket.id) room.hostId = room.players.keys().next().value;
-    if (room.imposterId === socket.id && room.phase === "playing") {
-      room.phase = "results"; room.winner = "players";
-      room.winReason = "The imposter disconnected. Players win!";
-    }
-    broadcastRoom(io, room);
+
+    const disconnectedId   = socket.id;
+    const disconnectedRoom = currentRoom;
+
+    setTimeout(() => {
+      const r = rooms.get(disconnectedRoom);
+      if (!r) return; // room already gone
+      if (!r.players.has(disconnectedId)) return; // already migrated to new socket
+      // Player truly disconnected — clean up
+      r.players.delete(disconnectedId);
+      if (r.players.size === 0) { rooms.delete(disconnectedRoom); return; }
+      if (r.hostId === disconnectedId) r.hostId = r.players.keys().next().value;
+      broadcastRoom(io, r);
+    }, 10000); // 10 second grace period
   });
 });
 
 const PORT = process.env.PORT || 3001;
-httpServer.listen(PORT, () => {
-  console.log(`Socket.io server running on port ${PORT}`);
-});
+httpServer.listen(PORT, () => console.log(`Socket.io server running on port ${PORT}`));
